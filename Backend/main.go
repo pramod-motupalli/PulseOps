@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"log"
 	"os"
 	"strings"
@@ -15,25 +14,11 @@ import (
 )
 
 func loadEnv(filepath string) {
-	file, err := os.Open(filepath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			val = strings.Trim(val, `"'`)
-			if os.Getenv(key) == "" {
-				os.Setenv(key, val)
+	data, _ := os.ReadFile(filepath)
+	for _, line := range strings.Split(string(data), "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok && !strings.HasPrefix(k, "#") {
+			if k = strings.TrimSpace(k); k != "" && os.Getenv(k) == "" {
+				os.Setenv(k, strings.Trim(strings.TrimSpace(v), `"'`))
 			}
 		}
 	}
@@ -81,22 +66,14 @@ func main() {
 	router := gin.Default()
 	router.Use(corsMiddleware())
 
+	// Public routes
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"service": "PulseOps",
-			"status":  "healthy",
-		})
+		c.JSON(200, gin.H{"service": "PulseOps", "status": "healthy"})
 	})
-
 	router.POST("/login", authHandler.Login)
 	router.POST("/register", authHandler.Register)
 
-	api := router.Group("/api/v1")
-	{
-		api.POST("/auth/register", authHandler.Register)
-		api.POST("/auth/login", authHandler.Login)
-	}
-
+	// Protected routes
 	protected := router.Group("/")
 	protected.Use(authmiddleware.AuthRequired([]byte(secret)))
 	{
@@ -109,26 +86,12 @@ func main() {
 		protected.DELETE("/nodes/:id", monitorHandler.DeleteNode)
 		protected.GET("/dashboard/stats", monitorHandler.GetDashboardStats)
 		protected.GET("/alerts", monitorHandler.GetAlerts)
-
-		v1Protected := protected.Group("/api/v1")
-		{
-			v1Protected.GET("/me", authHandler.Me)
-			v1Protected.GET("/nodes", monitorHandler.GetNodes)
-			v1Protected.POST("/nodes", monitorHandler.AddNode)
-			v1Protected.POST("/nodes/test", monitorHandler.TestEndpoint)
-			v1Protected.POST("/nodes/check-all", monitorHandler.CheckAllNodes)
-			v1Protected.POST("/nodes/:id/check", monitorHandler.CheckNode)
-			v1Protected.DELETE("/nodes/:id", monitorHandler.DeleteNode)
-			v1Protected.GET("/dashboard/stats", monitorHandler.GetDashboardStats)
-			v1Protected.GET("/alerts", monitorHandler.GetAlerts)
-		}
 	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "5000"
-	}
-	if !strings.HasPrefix(port, ":") {
+		port = ":5000"
+	} else if !strings.HasPrefix(port, ":") {
 		port = ":" + port
 	}
 

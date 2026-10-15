@@ -90,8 +90,6 @@ JWT_SECRET=super_secret_pulseops_jwt_signing_key_32chars_min
 | `POST` | `/register` | Register a new operator account | `{"name":"...","email":"...","password":"..."}` |
 | `POST` | `/login` | Authenticate and obtain JWT token | `{"email":"...","password":"..."}` |
 
-*(Also mirrored under `/api/v1/auth/register` and `/api/v1/auth/login`)*
-
 ### 3. Services & Endpoint Monitoring *(Requires Bearer Token)*
 
 | Method | Endpoint | Description | Request Body |
@@ -103,8 +101,6 @@ JWT_SECRET=super_secret_pulseops_jwt_signing_key_32chars_min
 | `POST` | `/nodes/:id/check` | Trigger an immediate live health check on a specific node | None |
 | `POST` | `/nodes/check-all` | Trigger immediate live health checks across all active nodes | None |
 | `DELETE` | `/nodes/:id` | Remove a monitored endpoint | None |
-
-*(All protected routes are also available prefixed with `/api/v1`)*
 
 ### 4. Metrics & Alerts *(Requires Bearer Token)*
 

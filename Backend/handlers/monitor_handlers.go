@@ -13,6 +13,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+var httpClient = &http.Client{
+	Timeout: 6 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
+}
+
 type MonitorHandler struct {
 	DB *sql.DB
 }
@@ -37,11 +44,9 @@ type NodeResponse struct {
 }
 
 type AddNodeRequest struct {
-	Name       string `json:"name" binding:"required"`
-	Endpoint   string `json:"endpoint"`
-	URL        string `json:"url"`
-	Status     string `json:"status"`
-	StatusCode int    `json:"statusCode"`
+	Name     string `json:"name" binding:"required"`
+	Endpoint string `json:"endpoint"`
+	URL      string `json:"url"`
 }
 
 type TestEndpointRequest struct {
@@ -49,26 +54,67 @@ type TestEndpointRequest struct {
 	URL      string `json:"url"`
 }
 
+func normalizeURL(targetURL string) string {
+	clean := strings.TrimSpace(targetURL)
+	if clean == "" {
+		return ""
+	}
+	if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
+		if strings.HasPrefix(clean, "localhost") || strings.HasPrefix(clean, "127.0.0.1") {
+			return "http://" + clean
+		}
+		return "https://" + clean
+	}
+	return clean
+}
+
+func classifyStatus(code, isUp int) string {
+	if isUp == 1 && code >= 200 && code < 400 {
+		return "Healthy"
+	}
+	if code >= 400 && code < 500 {
+		return "Warning"
+	}
+	return "Critical"
+}
+
+func buildNodeResponse(id int, name, url, method, status string, code int, respTime int64, errMsg, checkedAt, createdAt string) NodeResponse {
+	return NodeResponse{
+		ID:             id,
+		NodeID:         fmt.Sprintf("node-%02d", id),
+		Name:           name,
+		Endpoint:       url,
+		URL:            url,
+		Method:         method,
+		Status:         status,
+		StatusCode:     code,
+		ResponseTimeMS: respTime,
+		ErrorMessage:   errMsg,
+		LastChecked:    checkedAt,
+		CreatedAt:      createdAt,
+	}
+}
+
+func parseNodeID(c *gin.Context) (int, bool) {
+	id, err := strconv.Atoi(strings.TrimPrefix(c.Param("id"), "node-"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid node ID"})
+		return 0, false
+	}
+	return id, true
+}
+
+func (h *MonitorHandler) saveCheckResult(monitorID int, code int, respTime int64, isUp int, errMsg, checkedAt string) {
+	_, _ = h.DB.Exec(
+		"INSERT INTO check_results (monitor_id, status_code, response_time_ms, is_up, error_message, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
+		monitorID, code, respTime, isUp, errMsg, checkedAt,
+	)
+}
+
 func checkEndpoint(targetURL string) (statusCode int, responseTimeMs int64, isUp int, status string, errMsg string) {
-	cleanURL := strings.TrimSpace(targetURL)
+	cleanURL := normalizeURL(targetURL)
 	if cleanURL == "" {
 		return 0, 0, 0, "Critical", "Endpoint URL is empty"
-	}
-
-	if !strings.HasPrefix(cleanURL, "http://") && !strings.HasPrefix(cleanURL, "https://") {
-		if strings.HasPrefix(cleanURL, "localhost") || strings.HasPrefix(cleanURL, "127.0.0.1") {
-			cleanURL = "http://" + cleanURL
-		} else {
-			cleanURL = "https://" + cleanURL
-		}
-	}
-
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   6 * time.Second,
 	}
 
 	req, err := http.NewRequest("GET", cleanURL, nil)
@@ -79,14 +125,15 @@ func checkEndpoint(targetURL string) (statusCode int, responseTimeMs int64, isUp
 	req.Header.Set("Accept", "*/*")
 
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 
+	// Fallback for HTTPS endpoints that only accept HTTP
 	if err != nil && strings.HasPrefix(cleanURL, "https://") && (strings.Contains(err.Error(), "server gave HTTP response") || strings.Contains(err.Error(), "oversized record")) {
 		httpURL := "http://" + strings.TrimPrefix(cleanURL, "https://")
 		if retryReq, retryErr := http.NewRequest("GET", httpURL, nil); retryErr == nil {
 			retryReq.Header.Set("User-Agent", "PulseOps-Monitor/1.0 (+https://pulseops.dev)")
 			retryReq.Header.Set("Accept", "*/*")
-			if retryResp, retryDoErr := client.Do(retryReq); retryDoErr == nil {
+			if retryResp, retryDoErr := httpClient.Do(retryReq); retryDoErr == nil {
 				resp = retryResp
 				err = nil
 			}
@@ -105,13 +152,15 @@ func checkEndpoint(targetURL string) (statusCode int, responseTimeMs int64, isUp
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
 
 	code := resp.StatusCode
+	isUpVal := 0
+	errStr := ""
 	if code >= 200 && code < 400 {
-		return code, duration, 1, "Healthy", ""
-	} else if code >= 400 && code < 500 {
-		return code, duration, 0, "Warning", fmt.Sprintf("HTTP %d: %s", code, http.StatusText(code))
+		isUpVal = 1
 	} else {
-		return code, duration, 0, "Critical", fmt.Sprintf("HTTP %d: %s", code, http.StatusText(code))
+		errStr = fmt.Sprintf("HTTP %d: %s", code, http.StatusText(code))
 	}
+
+	return code, duration, isUpVal, classifyStatus(code, isUpVal), errStr
 }
 
 func (h *MonitorHandler) GetNodes(c *gin.Context) {
@@ -143,25 +192,20 @@ func (h *MonitorHandler) GetNodes(c *gin.Context) {
 
 	nodes := make([]NodeResponse, 0)
 	for rows.Next() {
-		var n NodeResponse
+		var id int
+		var name, url, method, createdAt string
+		var code int
+		var respTime int64
 		var isUp int
 		var errMsg, checkedAt string
-		if err := rows.Scan(&n.ID, &n.Name, &n.URL, &n.Method, &n.CreatedAt, &n.StatusCode, &n.ResponseTimeMS, &isUp, &errMsg, &checkedAt); err != nil {
+
+		if err := rows.Scan(&id, &name, &url, &method, &createdAt, &code, &respTime, &isUp, &errMsg, &checkedAt); err != nil {
 			continue
 		}
-		n.Endpoint = n.URL
-		n.NodeID = fmt.Sprintf("node-%02d", n.ID)
-		n.ErrorMessage = errMsg
-		n.LastChecked = checkedAt
 
-		if n.StatusCode >= 200 && n.StatusCode < 400 && isUp == 1 {
-			n.Status = "Healthy"
-		} else if n.StatusCode >= 400 && n.StatusCode < 500 {
-			n.Status = "Warning"
-		} else {
-			n.Status = "Critical"
-		}
-		nodes = append(nodes, n)
+		nodes = append(nodes, buildNodeResponse(
+			id, name, url, method, classifyStatus(code, isUp), code, respTime, errMsg, checkedAt, createdAt,
+		))
 	}
 
 	c.JSON(http.StatusOK, nodes)
@@ -180,22 +224,14 @@ func (h *MonitorHandler) AddNode(c *gin.Context) {
 		return
 	}
 
-	url := req.Endpoint
-	if url == "" {
-		url = req.URL
+	rawURL := req.Endpoint
+	if rawURL == "" {
+		rawURL = req.URL
 	}
-	url = strings.TrimSpace(url)
+	url := normalizeURL(rawURL)
 	if url == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Endpoint URL is required"})
 		return
-	}
-
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		if strings.HasPrefix(url, "localhost") || strings.HasPrefix(url, "127.0.0.1") {
-			url = "http://" + url
-		} else {
-			url = "https://" + url
-		}
 	}
 
 	statusCode, respTime, isUp, status, errMsg := checkEndpoint(url)
@@ -211,25 +247,9 @@ func (h *MonitorHandler) AddNode(c *gin.Context) {
 
 	id, _ := res.LastInsertId()
 	now := time.Now().Format("2006-01-02 15:04:05")
-	_, _ = h.DB.Exec(
-		"INSERT INTO check_results (monitor_id, status_code, response_time_ms, is_up, error_message, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
-		id, statusCode, respTime, isUp, errMsg, now,
-	)
+	h.saveCheckResult(int(id), statusCode, respTime, isUp, errMsg, now)
 
-	c.JSON(http.StatusCreated, NodeResponse{
-		ID:             int(id),
-		NodeID:         fmt.Sprintf("node-%02d", id),
-		Name:           req.Name,
-		Endpoint:       url,
-		URL:            url,
-		Method:         "GET",
-		Status:         status,
-		StatusCode:     statusCode,
-		ResponseTimeMS: respTime,
-		ErrorMessage:   errMsg,
-		LastChecked:    now,
-		CreatedAt:      now,
-	})
+	c.JSON(http.StatusCreated, buildNodeResponse(int(id), req.Name, url, "GET", status, statusCode, respTime, errMsg, now, now))
 }
 
 func (h *MonitorHandler) TestEndpoint(c *gin.Context) {
@@ -239,11 +259,11 @@ func (h *MonitorHandler) TestEndpoint(c *gin.Context) {
 		return
 	}
 
-	target := req.Endpoint
-	if target == "" {
-		target = req.URL
+	rawURL := req.Endpoint
+	if rawURL == "" {
+		rawURL = req.URL
 	}
-	target = strings.TrimSpace(target)
+	target := normalizeURL(rawURL)
 	if target == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Endpoint URL is required"})
 		return
@@ -261,16 +281,13 @@ func (h *MonitorHandler) TestEndpoint(c *gin.Context) {
 
 func (h *MonitorHandler) CheckNode(c *gin.Context) {
 	userID := c.GetString("userID")
-	idParam := c.Param("id")
-	cleanedID := strings.TrimPrefix(idParam, "node-")
-	id, err := strconv.Atoi(cleanedID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid node ID"})
+	id, ok := parseNodeID(c)
+	if !ok {
 		return
 	}
 
 	var name, targetURL, method, createdAt string
-	err = h.DB.QueryRow("SELECT name, url, method, created_at FROM monitors WHERE id = ? AND user_id = ?", id, userID).Scan(&name, &targetURL, &method, &createdAt)
+	err := h.DB.QueryRow("SELECT name, url, method, created_at FROM monitors WHERE id = ? AND user_id = ?", id, userID).Scan(&name, &targetURL, &method, &createdAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Node not found"})
 		return
@@ -278,25 +295,9 @@ func (h *MonitorHandler) CheckNode(c *gin.Context) {
 
 	statusCode, respTime, isUp, status, errMsg := checkEndpoint(targetURL)
 	now := time.Now().Format("2006-01-02 15:04:05")
-	_, _ = h.DB.Exec(
-		"INSERT INTO check_results (monitor_id, status_code, response_time_ms, is_up, error_message, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
-		id, statusCode, respTime, isUp, errMsg, now,
-	)
+	h.saveCheckResult(id, statusCode, respTime, isUp, errMsg, now)
 
-	c.JSON(http.StatusOK, NodeResponse{
-		ID:             id,
-		NodeID:         fmt.Sprintf("node-%02d", id),
-		Name:           name,
-		Endpoint:       targetURL,
-		URL:            targetURL,
-		Method:         method,
-		Status:         status,
-		StatusCode:     statusCode,
-		ResponseTimeMS: respTime,
-		ErrorMessage:   errMsg,
-		LastChecked:    now,
-		CreatedAt:      createdAt,
-	})
+	c.JSON(http.StatusOK, buildNodeResponse(id, name, targetURL, method, status, statusCode, respTime, errMsg, now, createdAt))
 }
 
 func (h *MonitorHandler) CheckAllNodes(c *gin.Context) {
@@ -331,25 +332,9 @@ func (h *MonitorHandler) CheckAllNodes(c *gin.Context) {
 	results := make([]NodeResponse, 0, len(items))
 	now := time.Now().Format("2006-01-02 15:04:05")
 	for _, it := range items {
-		statusCode, respTime, isUp, status, errMsg := checkEndpoint(it.url)
-		_, _ = h.DB.Exec(
-			"INSERT INTO check_results (monitor_id, status_code, response_time_ms, is_up, error_message, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
-			it.id, statusCode, respTime, isUp, errMsg, now,
-		)
-		results = append(results, NodeResponse{
-			ID:             it.id,
-			NodeID:         fmt.Sprintf("node-%02d", it.id),
-			Name:           it.name,
-			Endpoint:       it.url,
-			URL:            it.url,
-			Method:         it.method,
-			Status:         status,
-			StatusCode:     statusCode,
-			ResponseTimeMS: respTime,
-			ErrorMessage:   errMsg,
-			LastChecked:    now,
-			CreatedAt:      it.createdAt,
-		})
+		code, respTime, isUp, status, errMsg := checkEndpoint(it.url)
+		h.saveCheckResult(it.id, code, respTime, isUp, errMsg, now)
+		results = append(results, buildNodeResponse(it.id, it.name, it.url, it.method, status, code, respTime, errMsg, now, it.createdAt))
 	}
 
 	c.JSON(http.StatusOK, results)
@@ -357,49 +342,40 @@ func (h *MonitorHandler) CheckAllNodes(c *gin.Context) {
 
 func (h *MonitorHandler) DeleteNode(c *gin.Context) {
 	userID := c.GetString("userID")
-	idParam := c.Param("id")
-
-	cleanedID := strings.TrimPrefix(idParam, "node-")
-	id, err := strconv.Atoi(cleanedID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid node ID"})
+	id, ok := parseNodeID(c)
+	if !ok {
 		return
 	}
 
-	_, err = h.DB.Exec("DELETE FROM monitors WHERE id = ? AND user_id = ?", id, userID)
+	_, err := h.DB.Exec("DELETE FROM monitors WHERE id = ? AND user_id = ?", id, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete node"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Node deleted successfully", "id": idParam})
+	c.JSON(http.StatusOK, gin.H{"message": "Node deleted successfully", "id": c.Param("id")})
 }
 
 func (h *MonitorHandler) GetDashboardStats(c *gin.Context) {
 	userID := c.GetString("userID")
 
-	var totalNodes int
-	_ = h.DB.QueryRow("SELECT COUNT(*) FROM monitors WHERE user_id = ?", userID).Scan(&totalNodes)
-
-	var healthyNodes int
-	_ = h.DB.QueryRow(`
-		SELECT COUNT(DISTINCT m.id)
+	var totalNodes, healthyNodes, alertCount int
+	err := h.DB.QueryRow(`
+		SELECT 
+			COUNT(m.id),
+			COALESCE(SUM(CASE WHEN c.is_up = 1 AND c.status_code >= 200 AND c.status_code < 400 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN c.id IS NOT NULL AND (c.is_up = 0 OR c.status_code >= 400) THEN 1 ELSE 0 END), 0)
 		FROM monitors m
-		JOIN check_results c ON c.id = (
+		LEFT JOIN check_results c ON c.id = (
 			SELECT id FROM check_results WHERE monitor_id = m.id ORDER BY checked_at DESC, id DESC LIMIT 1
 		)
-		WHERE m.user_id = ? AND c.is_up = 1 AND c.status_code >= 200 AND c.status_code < 400
-	`, userID).Scan(&healthyNodes)
+		WHERE m.user_id = ?
+	`, userID).Scan(&totalNodes, &healthyNodes, &alertCount)
 
-	var alertCount int
-	_ = h.DB.QueryRow(`
-		SELECT COUNT(DISTINCT m.id)
-		FROM monitors m
-		JOIN check_results c ON c.id = (
-			SELECT id FROM check_results WHERE monitor_id = m.id ORDER BY checked_at DESC, id DESC LIMIT 1
-		)
-		WHERE m.user_id = ? AND (c.is_up = 0 OR c.status_code >= 400)
-	`, userID).Scan(&alertCount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load stats"})
+		return
+	}
 
 	warningNodes := totalNodes - healthyNodes
 	if warningNodes < 0 {
@@ -446,8 +422,6 @@ func (h *MonitorHandler) GetAlerts(c *gin.Context) {
 		severity := "HIGH"
 		if statusCode >= 500 || statusCode == 0 {
 			severity = "CRITICAL"
-		} else if statusCode >= 400 {
-			severity = "HIGH"
 		}
 
 		desc := errMsg.String
@@ -479,6 +453,7 @@ func (h *MonitorHandler) StartBackgroundChecker(interval time.Duration) {
 		if err != nil {
 			continue
 		}
+
 		type mon struct {
 			id  int
 			url string
@@ -495,10 +470,7 @@ func (h *MonitorHandler) StartBackgroundChecker(interval time.Duration) {
 		now := time.Now().Format("2006-01-02 15:04:05")
 		for _, m := range list {
 			code, respTime, isUp, _, errMsg := checkEndpoint(m.url)
-			_, _ = h.DB.Exec(
-				"INSERT INTO check_results (monitor_id, status_code, response_time_ms, is_up, error_message, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
-				m.id, code, respTime, isUp, errMsg, now,
-			)
+			h.saveCheckResult(m.id, code, respTime, isUp, errMsg, now)
 		}
 	}
 }
